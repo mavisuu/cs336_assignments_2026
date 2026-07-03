@@ -1,7 +1,7 @@
 import os
 from typing import BinaryIO
 import regex as re
-from collections import Counter
+from collections import Counter, defaultdict
 
 def find_chunk_boundaries(
     file: BinaryIO,
@@ -49,11 +49,14 @@ def find_chunk_boundaries(
     # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
     return sorted(set(chunk_boundaries))
 
-def count_pair_freq(pretoken_set: Counter[tuple[bytes, ...]]) -> Counter[tuple[bytes, bytes]]:
+def count_pair_freq(
+        pretoken_set: Counter[tuple[bytes, ...]]
+    ) -> tuple[Counter[tuple[bytes, bytes]], dict[tuple[bytes, bytes], set[tuple[bytes, ...]]]]:
     """
-    计算 token pair 的出现的频率，返回一个 counter
+    计算 token pair 的出现的频率，返回一个 counter, 并记录每个 pair 出现在哪些 pretoken 中, 返回 pair_to_pretoken
     """
     pair_freq: Counter[tuple[bytes, bytes]] = Counter()
+    pair_to_pretoken: dict[tuple[bytes, bytes], set[tuple[bytes, ...]]] = defaultdict(set)
     
     for pretoken, count in pretoken_set.items():
         if len(pretoken) < 2:
@@ -61,29 +64,81 @@ def count_pair_freq(pretoken_set: Counter[tuple[bytes, ...]]) -> Counter[tuple[b
         for i in range(len(pretoken) - 1):
             pair = (pretoken[i], pretoken[i + 1])
             pair_freq[pair] += count
+            pair_to_pretoken[pair].add(pretoken)
 
-    return pair_freq
+    return pair_freq, pair_to_pretoken
 
-def update_pretoken_set(
-    pretoken_set: Counter[tuple[bytes, ...]], best_pair: tuple[bytes, bytes]) -> Counter[tuple[bytes, ...]]:
+def merge_pretoken(pretoken: tuple[bytes, ...], best_pair: tuple[bytes, bytes]) -> tuple[bytes, ...]:
     """
-    将 pretoken_set 中的 best_pair 合并为一个 token，并更新 pretoken_set
+    将 pretoken 中的 best_pair 合并为一个 token, 返回新的 pretoken
     """
-    new_pretoken_set: Counter[tuple[bytes, ...]] = Counter()
+    new_pretoken = []
+    i = 0
+    while i < len(pretoken):
+        if i < len(pretoken) - 1 and (pretoken[i], pretoken[i+1]) == best_pair:
+            new_pretoken.append(pretoken[i] + pretoken[i+1])
+            i += 2
+        else:
+            new_pretoken.append(pretoken[i])
+            i += 1
 
-    for pretoken, count in pretoken_set.items():
-        new_pretoken = []
-        i = 0
-        while i < len(pretoken):
-            if i < len(pretoken) - 1 and (pretoken[i], pretoken[i+1]) == best_pair:
-                new_pretoken.append(best_pair[0] + best_pair[1])
-                i += 2
-            else:
-                new_pretoken.append(pretoken[i])
-                i += 1
-        new_pretoken_set[tuple(new_pretoken)] += count
+    return tuple(new_pretoken)
 
-    return new_pretoken_set
+
+
+def update(
+        pretoken_set: Counter[tuple[bytes, ...]], 
+        pair_to_pretoken: dict[tuple[bytes, bytes], set[tuple[bytes, ...]]], 
+        pair_freq: Counter[tuple[bytes, bytes]],
+        best_pair: tuple[bytes, bytes]
+    ) -> tuple[
+        Counter[tuple[bytes, ...]],
+        Counter[tuple[bytes, bytes]],
+        dict[tuple[bytes, bytes], set[tuple[bytes, ...]]]
+    ]:
+    """
+    将 pretoken_set 中的 best_pair 合并为一个 token，并更新 pretoken_set, 只需要更新包含 best_pair 的 pretoken 即可
+    """
+    affected_pretokens = list(pair_to_pretoken.get(best_pair, set()))
+
+    updates: Counter[tuple[bytes, ...]] = Counter()
+    
+    for pretoken in affected_pretokens:
+        count = pretoken_set[pretoken]
+        del pretoken_set[pretoken]
+
+        old_pair_counts = Counter(
+            (pretoken[i], pretoken[i + 1])
+            for i in range(len(pretoken) - 1)
+        )
+
+        # 减掉当前 pretoken 对 pair 的贡献
+        for pair, local_count in old_pair_counts.items():
+            pair_freq[pair] -= local_count * count
+            if pair_freq[pair] <= 0:
+                del pair_freq[pair]
+            if pair in pair_to_pretoken:
+                pair_to_pretoken[pair].discard(pretoken)
+                if not pair_to_pretoken[pair]:
+                    del pair_to_pretoken[pair]
+
+        # 合并
+        new_pretoken = merge_pretoken(pretoken, best_pair)
+        updates[new_pretoken] += count
+
+    # 统一加入 new_pretoken 及其 pair 贡献
+    for new_pretoken, count in updates.items():
+        pretoken_set[new_pretoken] += count
+        new_pair_counts = Counter(
+            (new_pretoken[i], new_pretoken[i + 1])
+            for i in range(len(new_pretoken) - 1)
+        )
+        for new_pair, local_count in new_pair_counts.items():
+            pair_freq[new_pair] += local_count * count
+            pair_to_pretoken[new_pair].add(new_pretoken)
+        
+    return pretoken_set, pair_freq, pair_to_pretoken
+
 
 def train_bpe(
     input_path: str | os.PathLike,
@@ -147,18 +202,18 @@ def train_bpe(
                     pretoken_set[pretoken] += 1
 
     # 4. 根据 pre-token counts 进行 BPE merge, 直到 vocab_size 达到要求
+    # 统计初始的 pair frequency 并维护一个 pair to pretoken, 记录每个 pair 出现在哪些 pretoken 中, 方便后续更新 pretoken_set
+    pair_freq, pair_to_pretoken = count_pair_freq(pretoken_set)
+
     for _ in range(vocab_size - len(vocab)):
-        pair_freq: Counter[tuple[bytes, bytes]] = count_pair_freq(pretoken_set)
-        if not pair_freq:
-            break
         best_pair: tuple[bytes, bytes] = max((item[1], item[0]) for item in pair_freq.items())[1]
         vocab[len(vocab)] = best_pair[0] + best_pair[1]
         merges.append(best_pair)
 
         # 更新 pretoken_set
-        pretoken_set: Counter[tuple[bytes, ...]] = update_pretoken_set(pretoken_set, best_pair)
+        pretoken_set, pair_freq, pair_to_pretoken = update(pretoken_set, pair_to_pretoken, pair_freq, best_pair)
 
     # raise NotImplementedError
 
-    return (vocab, merges)
+    return vocab, merges
     
