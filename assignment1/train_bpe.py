@@ -214,6 +214,6 @@ def train_bpe(
         pretoken_set, pair_freq, pair_to_pretoken = update(pretoken_set, pair_to_pretoken, pair_freq, best_pair)
 
     # raise NotImplementedError
-
+    
     return vocab, merges
     
